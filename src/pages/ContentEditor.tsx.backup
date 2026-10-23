@@ -1,0 +1,511 @@
+import { useEffect, useMemo, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
+import Layout from "../components/Layout";
+import RichTextEditor from "../components/editor/RichTextEditor";
+import ScorePanel from "../components/editor/ScorePanel";
+import SeoFields from "../components/editor/SeoFields";
+import { useDebouncedScore } from "../hooks/useDebouncedScore";
+import {
+  ApiError,
+  CONTENT_TYPES,
+  LABEL_BY_TYPE,
+  createContent,
+  emptyDraft,
+  getContent,
+  isContentType,
+  slugify,
+  updateContent,
+  type ContentDetail,
+  type ContentDraft,
+  type ContentType,
+} from "../lib/api";
+import { PLACEHOLDER_IMAGE_NAME, placeholderImageFile } from "../lib/placeholderImage";
+
+/** Rough word count of an HTML body — mirrors how the scorer counts. */
+function countWords(html: string): number {
+  const text = html
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .trim();
+  return text ? text.split(/\s+/).length : 0;
+}
+
+/**
+ * The backend's Zod schema rejects these with a bare 400, so check them here
+ * and say which field is wrong in words the writer can act on.
+ */
+function validate(draft: ContentDraft): string[] {
+  const problems: string[] = [];
+  if (!draft.title.trim()) problems.push("Give it a title.");
+  if (!draft.slug.trim()) problems.push("The URL slug can't be empty.");
+  if (draft.shortDesc.trim().length < 50)
+    problems.push(
+      `The short description needs at least 50 characters — it has ${draft.shortDesc.trim().length}.`,
+    );
+  if (draft.content.length < 100)
+    problems.push("The body is too short to save — write at least a paragraph.");
+  if (!draft.category.trim()) problems.push("Pick a category.");
+  if (!draft.tags.trim()) problems.push("Add at least one tag.");
+  if (!draft.seo.focusKeyword.trim())
+    problems.push("Set a focus keyword — the SEO keywords are built from it.");
+  if (!draft.seo.title.trim()) problems.push("Write a meta title.");
+  if (!draft.seo.description.trim()) problems.push("Write a meta description.");
+  return problems;
+}
+
+/** Word-count floor the engine expects, by type. */
+function minWords(type: ContentType): number {
+  return type === "POST" ? 600 : 1200;
+}
+
+function draftFromDetail(item: ContentDetail): ContentDraft {
+  const base = emptyDraft(item.type);
+  return {
+    ...base,
+    id: item.id,
+    type: item.type,
+    title: item.title ?? "",
+    slug: item.slug ?? "",
+    shortDesc: item.shortDesc ?? "",
+    content: item.content ?? "",
+    category: item.category || base.category,
+    tags: item.tags || base.tags,
+    faqs: item.faqs ?? [],
+    seo: {
+      title: item.seo?.title ?? "",
+      description: item.seo?.description ?? "",
+      keywords: item.seo?.keywords ?? "",
+      focusKeyword: item.seo?.focusKeyword ?? "",
+      secondaryKeywords: item.seo?.secondaryKeywords ?? [],
+      aiQueries: item.seo?.aiQueries ?? "",
+      tldr: item.seo?.tldr ?? "",
+      hasFaq: item.seo?.hasFaq ?? false,
+    },
+  };
+}
+
+const labelClass = "block text-sm font-medium text-gray-700";
+const inputClass =
+  "mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 transition";
+
+export default function ContentEditor() {
+  const { slug: routeSlug } = useParams<{ slug: string }>();
+  const [params] = useSearchParams();
+  const isEdit = Boolean(routeSlug);
+
+  const initialType = isContentType(params.get("type")) ? (params.get("type") as ContentType) : "POST";
+
+  const [draft, setDraft] = useState<ContentDraft>(() => emptyDraft(initialType));
+  // Once the writer edits the slug by hand it stops tracking the title —
+  // silently renaming a live URL would break every existing link to it.
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [loading, setLoading] = useState(isEdit);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  // Set once the item exists in the database — either we opened an existing
+  // one, or we just created it. Anything after that is an update, not a create.
+  const [savedSlug, setSavedSlug] = useState<string | null>(routeSlug ?? null);
+  const [hasStoredImage, setHasStoredImage] = useState(false);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [banner, setBanner] = useState<
+    { kind: "ok" | "error"; text: string; problems?: string[]; expired?: boolean } | null
+  >(null);
+
+  useEffect(() => {
+    if (!routeSlug) return;
+    let cancelled = false;
+
+    setLoading(true);
+    setLoadError(null);
+    getContent(routeSlug)
+      .then((item) => {
+        if (cancelled) return;
+        setDraft(draftFromDetail(item));
+        setSlugTouched(true); // an existing slug is never auto-rewritten
+        setSavedSlug(item.slug);
+        setHasStoredImage(Boolean(item.image));
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setLoadError(e instanceof Error ? e.message : "Couldn't load this item.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [routeSlug]);
+
+  function patch(changes: Partial<ContentDraft>) {
+    setDraft((d) => ({ ...d, ...changes }));
+  }
+
+  function handleTitleChange(value: string) {
+    setDraft((d) => ({
+      ...d,
+      title: value,
+      slug: slugTouched ? d.slug : slugify(value),
+    }));
+  }
+
+  // The server derives the featured image's ALT from the focus keyword when it
+  // re-scores after a save. Mirror that here so the live number matches the
+  // stored one — but only when there really is an image, so the preview never
+  // claims credit the saved item wouldn't get.
+  const hasImage = Boolean(imageFile) || hasStoredImage;
+  const scoringDraft = useMemo<ContentDraft>(
+    () => ({
+      ...draft,
+      featuredImage: hasImage ? { alt: draft.seo.focusKeyword } : undefined,
+    }),
+    [draft, hasImage],
+  );
+
+  const scoreState = useDebouncedScore(scoringDraft);
+
+  const words = countWords(draft.content);
+  const target = minWords(draft.type);
+
+  async function handleSave(status: "draft" | "published") {
+    const problems = validate(draft);
+    if (problems.length > 0) {
+      setBanner({
+        kind: "error",
+        text: "Not saved — a few things need fixing first:",
+        problems,
+      });
+      return;
+    }
+
+    setSaving(true);
+    setBanner(null);
+
+    // seo.keywords is required by the API but is just the keyword set, so
+    // build it rather than asking the writer for the same words twice.
+    const payload: ContentDraft = {
+      ...draft,
+      seo: {
+        ...draft.seo,
+        keywords: [draft.seo.focusKeyword, ...draft.seo.secondaryKeywords]
+          .map((k) => k.trim())
+          .filter(Boolean)
+          .join(", "),
+      },
+    };
+
+    try {
+      if (savedSlug) {
+        const res = await updateContent(savedSlug, payload, imageFile, status);
+        setSavedSlug(payload.slug);
+        if (imageFile) setHasStoredImage(true);
+        setBanner({
+          kind: "ok",
+          text:
+            res.message ??
+            (status === "published" ? "Published." : "Draft saved."),
+        });
+      } else {
+        const file = imageFile ?? placeholderImageFile();
+        const res = await createContent(payload, file, status);
+        setSavedSlug(payload.slug);
+        setHasStoredImage(Boolean(imageFile));
+        // Adopt the new record's id so the focus-keyword uniqueness check stops
+        // matching this item against itself.
+        if (res.id) patch({ id: res.id });
+        setBanner({
+          kind: "ok",
+          text:
+            res.score !== undefined
+              ? `${status === "published" ? "Published" : "Draft saved"} — the server scored it ${res.score}/100.`
+              : (res.message ?? "Saved."),
+        });
+      }
+    } catch (e) {
+      const expired = e instanceof ApiError && e.status === 401;
+      setBanner({
+        kind: "error",
+        text: expired
+          ? "Your session has expired — sign in again and your work will still be here."
+          : e instanceof Error
+            ? e.message
+            : "Couldn't save. Check your connection and try again.",
+        expired,
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const title = isEdit ? `Edit: ${draft.title || routeSlug}` : "New content";
+
+  if (loading) {
+    return (
+      <Layout title="Loading…">
+        <p className="p-10 text-center text-sm text-gray-500">Loading…</p>
+      </Layout>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <Layout title="Content">
+        <div className="p-10 text-center">
+          <p className="text-sm text-red-600">{loadError}</p>
+          <Link
+            to="/content"
+            className="mt-3 inline-block rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition"
+          >
+            Back to list
+          </Link>
+        </div>
+      </Layout>
+    );
+  }
+
+  return (
+    <Layout
+      title={title}
+      actions={
+        <div className="flex items-center gap-2">
+          <Link
+            to={`/content?type=${draft.type}`}
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 transition"
+          >
+            Back
+          </Link>
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => void handleSave("draft")}
+            className="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 transition"
+          >
+            {saving ? "Saving…" : "Save draft"}
+          </button>
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() => void handleSave("published")}
+            className="rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white hover:bg-brand-dark disabled:opacity-50 transition"
+          >
+            Publish
+          </button>
+        </div>
+      }
+    >
+      <div className="p-8">
+        {banner && (
+          <div
+            className={`mb-6 rounded-xl border px-4 py-3 text-sm ${
+              banner.kind === "ok"
+                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                : "border-red-200 bg-red-50 text-red-800"
+            }`}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="font-medium">{banner.text}</p>
+                {banner.problems && (
+                  <ul className="mt-1.5 list-disc space-y-0.5 pl-5">
+                    {banner.problems.map((p) => (
+                      <li key={p}>{p}</li>
+                    ))}
+                  </ul>
+                )}
+                {banner.expired && (
+                  <Link
+                    to="/login"
+                    className="mt-2 inline-block font-medium underline"
+                  >
+                    Go to sign in
+                  </Link>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setBanner(null)}
+                className="shrink-0 opacity-60 hover:opacity-100"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
+          {/* ---------------- Left: the draft ---------------- */}
+          <div className="space-y-4">
+            <section className="rounded-2xl bg-white border border-gray-200 p-6 space-y-4">
+              <div>
+                <label className={labelClass} htmlFor="type">
+                  Type
+                </label>
+                <select
+                  id="type"
+                  value={draft.type}
+                  onChange={(e) => patch({ type: e.target.value as ContentType })}
+                  className={inputClass}
+                >
+                  {CONTENT_TYPES.map((t) => (
+                    <option key={t} value={t}>
+                      {LABEL_BY_TYPE[t]}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-xs text-gray-500">
+                  Sets the word-count target: {minWords(draft.type)}+ words.
+                </p>
+              </div>
+
+              <div>
+                <label className={labelClass} htmlFor="title">
+                  Title
+                </label>
+                <input
+                  id="title"
+                  type="text"
+                  value={draft.title}
+                  onChange={(e) => handleTitleChange(e.target.value)}
+                  placeholder="How to send bulk SMS in India"
+                  className={inputClass}
+                />
+              </div>
+
+              <div>
+                <label className={labelClass} htmlFor="slug">
+                  URL slug
+                </label>
+                <input
+                  id="slug"
+                  type="text"
+                  value={draft.slug}
+                  onChange={(e) => {
+                    setSlugTouched(true);
+                    patch({ slug: slugify(e.target.value) });
+                  }}
+                  placeholder="how-to-send-bulk-sms-in-india"
+                  className={inputClass}
+                />
+                <p className="mt-1 text-xs text-gray-500">
+                  {slugTouched
+                    ? "Set manually — it no longer follows the title."
+                    : "Following the title. Edit it once and it stays put."}{" "}
+                  {draft.slug.length > 75 && (
+                    <span className="text-red-600">
+                      {draft.slug.length} chars — the engine wants 75 or fewer.
+                    </span>
+                  )}
+                </p>
+              </div>
+
+              <div>
+                <label className={labelClass} htmlFor="shortDesc">
+                  Short description
+                </label>
+                <textarea
+                  id="shortDesc"
+                  rows={3}
+                  value={draft.shortDesc}
+                  onChange={(e) => patch({ shortDesc: e.target.value })}
+                  placeholder="A one-paragraph summary used in listings."
+                  className={inputClass}
+                />
+                <p
+                  className={`mt-1 text-xs ${
+                    draft.shortDesc.length > 0 && draft.shortDesc.length < 50
+                      ? "text-red-600"
+                      : "text-gray-500"
+                  }`}
+                >
+                  {draft.shortDesc.length} characters — needs at least 50 to save.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className={labelClass} htmlFor="category">
+                    Category
+                  </label>
+                  <input
+                    id="category"
+                    type="text"
+                    value={draft.category}
+                    onChange={(e) => patch({ category: e.target.value })}
+                    className={inputClass}
+                  />
+                </div>
+                <div>
+                  <label className={labelClass} htmlFor="tags">
+                    Tags
+                  </label>
+                  <input
+                    id="tags"
+                    type="text"
+                    value={draft.tags}
+                    onChange={(e) => patch({ tags: e.target.value })}
+                    placeholder="celitix, sms"
+                    className={inputClass}
+                  />
+                  <p className="mt-1 text-xs text-gray-500">Comma-separated.</p>
+                </div>
+              </div>
+
+              <div>
+                <label className={labelClass} htmlFor="image">
+                  Featured image <span className="text-gray-400">(optional)</span>
+                </label>
+                <input
+                  id="image"
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => setImageFile(e.target.files?.[0] ?? null)}
+                  className="mt-1 block w-full text-sm text-gray-600 file:mr-3 file:rounded-lg file:border-0 file:bg-brand-50 file:px-3 file:py-2 file:text-sm file:font-medium file:text-brand hover:file:bg-brand-50/70"
+                />
+                {imageFile ? (
+                  <p className="mt-1 text-xs text-emerald-600">{imageFile.name}</p>
+                ) : hasStoredImage ? (
+                  <p className="mt-1 text-xs text-gray-500">
+                    Keeping the existing image. Choose a file to replace it.
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs text-amber-700">
+                    None chosen. The API refuses to create content without a
+                    file, so we'll attach a 1-pixel placeholder
+                    (<code>{PLACEHOLDER_IMAGE_NAME}</code>) — this is a stand-in,
+                    not a picture, and the image checks will stay red until a
+                    media manager exists.
+                  </p>
+                )}
+              </div>
+            </section>
+
+            <section className="rounded-2xl bg-white border border-gray-200 p-6 space-y-2">
+              <span className={labelClass}>Body</span>
+              <RichTextEditor
+                value={draft.content}
+                onChange={(html) => patch({ content: html })}
+              />
+              <p className="text-xs text-gray-500">
+                <span className={words < target ? "text-amber-600" : "text-emerald-600"}>
+                  {words} words
+                </span>{" "}
+                — target {target}–3500. Use H2s, a list, and links: the score
+                grades the structure, not just the prose.
+              </p>
+            </section>
+
+            <SeoFields draft={draft} onChange={patch} />
+          </div>
+
+          {/* ---------------- Right: the score ---------------- */}
+          <aside className="xl:sticky xl:top-8 xl:self-start">
+            <ScorePanel {...scoreState} />
+          </aside>
+        </div>
+      </div>
+    </Layout>
+  );
+}

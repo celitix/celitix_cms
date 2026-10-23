@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc *)",
+      "Bash(echo \"tsc exit=$?\")",
+      "Bash(npx oxlint *)",
+      "Bash(npx vite *)",
+      "Bash(npm install *)",
+      "Bash(node -p \"const p=require\\('./package.json'\\); JSON.stringify\\(p.dependencies,null,2\\)\")",
+      "Bash(node -e \"const sk=require\\('./node_modules/@tiptap/starter-kit/package.json'\\); console.log\\(sk.version\\); console.log\\(JSON.stringify\\(Object.keys\\(sk.dependencies||{}\\),null,1\\)\\)\")",
+      "Bash(node *)"
+    ]
+  }
+}
