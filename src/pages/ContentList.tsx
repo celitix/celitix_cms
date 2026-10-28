@@ -16,6 +16,14 @@ const STATUS_PILL: Record<string, string> = {
   HIDDEN: "bg-amber-50 text-amber-700 ring-amber-200",
 };
 
+/** Public-site path prefix for each type; pages live at the site root. */
+const PATH_BY_TYPE: Record<ContentType, string> = {
+  PAGE: "",
+  POST: "blog/",
+  GUIDE: "guides/",
+  CASE_STUDY: "case-study/",
+};
+
 function ScoreBadge({ score }: { score: number | null | undefined }) {
   if (score === null || score === undefined) {
     return <span className="text-sm text-gray-400">—</span>;
@@ -135,7 +143,7 @@ export default function ContentList() {
                     <td className="px-5 py-3 text-right">
                       <div className="flex items-center justify-end gap-4">
                         <a
-                          href={`${import.meta.env.VITE_SITE_URL || "http://localhost:3001"}/${item.type === "POST" ? "blog/" : ""}${item.slug}`}
+                          href={`${import.meta.env.VITE_SITE_URL || "http://localhost:3001"}/${PATH_BY_TYPE[item.type] ?? ""}${item.slug}`}
                           target="_blank"
                           rel="noreferrer"
                           className="font-medium text-gray-500 hover:text-brand"

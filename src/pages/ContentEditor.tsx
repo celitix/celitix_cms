@@ -107,6 +107,34 @@ function draftFromDetail(item: ContentDetail): ContentDraft {
   };
 }
 
+/** Id prefix marking the item's already-saved image in the picked list. */
+const STORED_ID = "stored:";
+
+/**
+ * The item's saved featured image as a picker entry. The backend stores the
+ * multer path (`uploads/123.jpg`, backslashes on Windows) and serves it from
+ * /api/uploads. It isn't a Library row, so its only known metadata is the ALT
+ * the server derives from the focus keyword.
+ */
+function storedImageItem(image: string, focusKeyword: string): MediaItem {
+  const filename = image.split(/[\\/]/).pop() ?? image;
+  const url = /^https?:\/\//i.test(image) ? image : `/api/uploads/${filename}`;
+  return {
+    id: `${STORED_ID}${image}`,
+    filename,
+    originalName: filename,
+    url,
+    mimeType: "",
+    size: 0,
+    alt: focusKeyword,
+    title: "",
+    caption: "",
+    description: "",
+    createdAt: "",
+    updatedAt: "",
+  };
+}
+
 const labelClass = "block text-sm font-medium text-gray-700";
 const inputClass =
   "mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 transition";
@@ -176,6 +204,13 @@ export default function ContentEditor() {
         setSlugTouched(true); // an existing slug is never auto-rewritten
         setSavedSlug(item.slug);
         setHasStoredImage(Boolean(item.image));
+        // Show the saved featured image in the picker list so it isn't lost
+        // from view (and from the score) when the item is reopened.
+        setPicked(
+          item.image
+            ? [storedImageItem(item.image, item.seo?.focusKeyword ?? "")]
+            : [],
+        );
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -301,8 +336,10 @@ export default function ContentEditor() {
     // The picked featured image already lives on the server. Fetch it back as a
     // File so it goes through the existing multipart upload path unchanged —
     // no backend or api.ts change needed.
+    // The item's own saved image is already in place on the server — skip the
+    // re-upload so an unchanged image isn't replaced by a copy of itself.
     let fileToSend = imageFile;
-    if (!fileToSend && picked[0]) {
+    if (!fileToSend && picked[0] && !picked[0].id.startsWith(STORED_ID)) {
       try {
         const res = await fetch(mediaSrc(picked[0].url));
         const blob = await res.blob();
